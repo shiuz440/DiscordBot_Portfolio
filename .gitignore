@@ -1,0 +1,18 @@
+# セキュリティ・認証情報
+.env
+
+# 自動生成される音声・テキストデータ
+archives/
+
+# Python関連のキャッシュや不要ファイル
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 仮想環境
+venv/
+.venv/
+env/
+
+# OS固有のファイル
+.DS_Store
