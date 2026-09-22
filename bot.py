@@ -1,7 +1,10 @@
 import asyncio
-import datetime
 import os
 import re
+import shutil
+import tempfile
+import threading
+import uuid
 
 import discord
 import requests
@@ -28,12 +31,40 @@ TRANSCRIPT_END = "<<<END_UNTRUSTED_TRANSCRIPT>>>"
 ARCHIVES_DIR = "archives"
 
 
-def load_allowed_user_ids() -> set[str]:
-    raw = os.getenv("ALLOWED_USER_IDS", "")
-    return {part.strip() for part in raw.split(",") if part.strip().isdigit()}
+class ConfigurationError(Exception):
+    pass
 
 
-ALLOWED_USER_IDS = load_allowed_user_ids()
+def load_allowed_user_ids(raw: str | None = None) -> set[str]:
+    if raw is None:
+        raw = os.getenv("ALLOWED_USER_IDS")
+        if raw is None:
+            return set()
+    if raw.strip() == "":
+        return set()
+
+    allowed: set[str] = set()
+    invalid: list[str] = []
+    for part in raw.split(","):
+        token = part.strip()
+        if not token:
+            continue
+        if token.isascii() and token.isdigit():
+            allowed.add(token)
+        else:
+            invalid.append(token)
+    if invalid:
+        shown = ", ".join(invalid[:5])
+        raise ConfigurationError(
+            "設定エラー: ALLOWED_USER_IDS にASCII数字以外が含まれています: " + shown
+        )
+    return allowed
+
+
+try:
+    ALLOWED_USER_IDS = load_allowed_user_ids()
+except ConfigurationError:
+    ALLOWED_USER_IDS = set()
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -43,7 +74,10 @@ client = discord.Client(
 )
 
 whisper_model = None
-inference_lock = asyncio.Lock()
+# Held inside the worker thread, not around asyncio.to_thread().
+# Cancelling the waiting task does not release this lock until transcribe() returns,
+# so the shared WhisperModel is never entered by two jobs at once.
+whisper_model_lock = threading.Lock()
 
 
 def sanitize_filename(filename: str, fallback: str) -> str:
@@ -59,6 +93,9 @@ def audio_extension(filename: str) -> str:
 
 
 def has_audio_signature(header: bytes, extension: str) -> bool:
+    # Common container prefixes only. This is not a safety guarantee:
+    # unusual but valid audio can be rejected, and non-audio that shares
+    # these opening bytes can be accepted.
     if len(header) < 12:
         return False
     if extension == ".wav":
@@ -85,6 +122,24 @@ def path_stays_in_archives(path: str) -> bool:
         return False
 
 
+def utf16_len(text: str) -> int:
+    return len(text.encode("utf-16-le")) // 2
+
+
+def largest_utf16_prefix(text: str, limit: int) -> int:
+    low = 0
+    high = len(text)
+    best = 0
+    while low <= high:
+        mid = (low + high) // 2
+        if utf16_len(text[:mid]) <= limit:
+            best = mid
+            low = mid + 1
+        else:
+            high = mid - 1
+    return best
+
+
 def split_discord_message(text: str, limit: int = DISCORD_MESSAGE_LIMIT) -> list[str]:
     if limit < 1:
         raise ValueError("Discord message limit must be positive")
@@ -94,23 +149,24 @@ def split_discord_message(text: str, limit: int = DISCORD_MESSAGE_LIMIT) -> list
 
     chunks: list[str] = []
     remaining = normalized
-    while remaining:
-        if len(remaining) <= limit:
+    while remaining.strip():
+        if utf16_len(remaining) <= limit:
             chunks.append(remaining)
             break
-        window = remaining[:limit]
+        window_end = largest_utf16_prefix(remaining, limit)
+        if window_end < 1:
+            window_end = 1
+        window = remaining[:window_end]
         split_at = window.rfind("\n")
-        if split_at < limit // 2:
+        if split_at < window_end // 2:
             split_at = window.rfind(" ")
         if split_at < 1:
-            split_at = limit
-        piece = remaining[:split_at].rstrip()
-        if not piece:
-            piece = remaining[:limit]
-            split_at = limit
-        chunks.append(piece)
-        remaining = remaining[split_at:].lstrip("\n")
-    return chunks
+            split_at = window_end
+        piece = remaining[:split_at].strip()
+        if piece:
+            chunks.append(piece)
+        remaining = remaining[split_at:].strip()
+    return chunks or ["内容は空でした。"]
 
 
 def wrap_untrusted_transcript(text: str) -> str:
@@ -137,7 +193,7 @@ def post_ollama(prompt: str, options: dict) -> str:
     return payload["response"]
 
 
-def correct_transcription(text: str) -> str:
+def correct_transcription(text: str) -> tuple[str, bool]:
     fenced = wrap_untrusted_transcript(text)
     prompt = f"""
 [指令]
@@ -157,10 +213,10 @@ def correct_transcription(text: str) -> str:
 {fenced}
 """
     try:
-        return post_ollama(prompt, {"temperature": 0.1})
+        return post_ollama(prompt, {"temperature": 0.1}), True
     except (requests.RequestException, ValueError, KeyError) as exc:
         print(f"Correction failed, using raw text: {type(exc).__name__}: {exc}")
-        return text
+        return text, False
 
 
 def generate_summary(text: str) -> str:
@@ -192,8 +248,63 @@ def generate_summary(text: str) -> str:
 
 
 def transcribe_audio(model, audio_path: str) -> str:
-    segments, _info = model.transcribe(audio_path, beam_size=5)
-    return " ".join(segment.text for segment in segments)
+    with whisper_model_lock:
+        segments, _info = model.transcribe(audio_path, beam_size=5)
+        return " ".join(segment.text for segment in segments)
+
+
+def transcript_label(correction_ok: bool, raw_length: int) -> str:
+    if not correction_ok:
+        return "文字起こし結果（未校正）です。"
+    if raw_length > CORRECTION_CHAR_LIMIT:
+        return "文字起こし結果（先頭を校正済み、残りは未校正）です。"
+    return "文字起こし結果（校正済み）です。"
+
+
+def prune_empty_dirs(start: str) -> None:
+    current = os.path.abspath(start)
+    root = os.path.abspath(ARCHIVES_DIR)
+    if current != root and os.path.commonpath([current, root]) != root:
+        return
+    while True:
+        try:
+            os.rmdir(current)
+        except OSError:
+            break
+        if current == root:
+            break
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        current = parent
+
+
+def discard_published(paths: list[str]) -> None:
+    parents: list[str] = []
+    for path in paths:
+        remove_file(path)
+        parents.append(os.path.dirname(path))
+    for parent in parents:
+        prune_empty_dirs(parent)
+
+
+def publish_job(audio_path: str, txt_path: str, archive_dir: str, published: list[str]) -> None:
+    os.makedirs(archive_dir, exist_ok=True)
+    for src in (audio_path, txt_path):
+        dest = os.path.join(archive_dir, os.path.basename(src))
+        if not path_stays_in_archives(dest):
+            raise ValueError("archive destination escaped archives")
+        shutil.move(src, dest)
+        published.append(dest)
+
+
+def build_job_filename(job_id: str, filename: str, extension: str) -> str:
+    safe_name = sanitize_filename(filename or "audio", "audio")
+    if not safe_name.lower().endswith(extension):
+        safe_name = f"{safe_name}{extension}"
+    stem, ext = os.path.splitext(safe_name)
+    stem = stem[:80] or "audio"
+    return f"{job_id}_{stem}{ext}"
 
 
 def remove_file(path: str) -> None:
@@ -204,7 +315,9 @@ def remove_file(path: str) -> None:
 
 
 async def send_chunked(channel, text: str, reply_message=None) -> None:
-    chunks = split_discord_message(text)
+    chunks = [chunk for chunk in split_discord_message(text) if chunk.strip()]
+    if not chunks:
+        chunks = ["内容は空でした。"]
     for index, chunk in enumerate(chunks):
         if index == 0 and reply_message is not None:
             await reply_message.reply(chunk)
@@ -265,30 +378,21 @@ async def on_message(message):
     )
     channel_label = message.channel.name if hasattr(message.channel, "name") else "DM"
     channel_name = sanitize_filename(channel_label, "DM")
-    save_dir = os.path.join(ARCHIVES_DIR, guild_name, channel_name)
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_name = sanitize_filename(attachment.filename or "audio", "audio")
-    if not safe_name.lower().endswith(extension):
-        safe_name = f"{safe_name}{extension}"
-    audio_path = os.path.join(save_dir, f"{timestamp}_{safe_name}")
-    txt_path = audio_path + ".txt"
+    job_id = uuid.uuid4().hex
+    job_filename = build_job_filename(job_id, attachment.filename or "audio", extension)
 
-    if not path_stays_in_archives(audio_path) or not path_stays_in_archives(txt_path):
-        await send_chunked(
-            message.channel,
-            "ファイル名を確認できなかったため、処理を中止しました。",
-            reply_message=message,
-        )
-        return
-
+    temp_dir = None
+    archive_dir = None
+    published: list[str] = []
     try:
-        os.makedirs(save_dir, exist_ok=True)
+        temp_dir = tempfile.mkdtemp(prefix=f"lecture-{job_id}-")
+        audio_path = os.path.join(temp_dir, job_filename)
+        txt_path = audio_path + ".txt"
         await attachment.save(audio_path)
         saved_size = os.path.getsize(audio_path)
         with open(audio_path, "rb") as handle:
             header = handle.read(64)
         if saved_size <= 0 or saved_size > MAX_AUDIO_BYTES or not has_audio_signature(header, extension):
-            remove_file(audio_path)
             await send_chunked(
                 message.channel,
                 "音声ファイルの内容を確認できなかったため、処理を中止しました。",
@@ -305,41 +409,56 @@ async def on_message(message):
         if whisper_model is None:
             raise RuntimeError("Whisper model is not loaded")
 
-        async with inference_lock:
-            raw_text = await asyncio.to_thread(transcribe_audio, whisper_model, audio_path)
+        raw_text = await asyncio.to_thread(transcribe_audio, whisper_model, audio_path)
         print(f"Transcription finished: {len(raw_text)} characters")
 
         await message.channel.send("専門用語の校正を実行しています。")
         corrected_text = raw_text
+        correction_ok = False
         if raw_text:
-            async with inference_lock:
-                corrected_head = await asyncio.to_thread(
-                    correct_transcription,
-                    raw_text[:CORRECTION_CHAR_LIMIT],
-                )
-            corrected_text = corrected_head
-            if len(raw_text) > CORRECTION_CHAR_LIMIT:
-                corrected_text += raw_text[CORRECTION_CHAR_LIMIT:]
+            corrected_head, correction_ok = await asyncio.to_thread(
+                correct_transcription,
+                raw_text[:CORRECTION_CHAR_LIMIT],
+            )
+            if correction_ok:
+                corrected_text = corrected_head
+                if len(raw_text) > CORRECTION_CHAR_LIMIT:
+                    corrected_text += raw_text[CORRECTION_CHAR_LIMIT:]
+            else:
+                corrected_text = raw_text
 
         with open(txt_path, "w", encoding="utf-8") as handle:
             handle.write(corrected_text)
 
-        await message.channel.send(
-            "文字起こし結果（校正済み）です。",
-            file=discord.File(txt_path),
-        )
-        await message.channel.send("要約を作成しています。")
-        async with inference_lock:
-            summary = await asyncio.to_thread(
-                generate_summary,
-                corrected_text[:MAX_TRANSCRIPT_CHARS],
+        transcript_file = discord.File(txt_path)
+        try:
+            await message.channel.send(
+                transcript_label(correction_ok, len(raw_text)),
+                file=transcript_file,
             )
+        finally:
+            transcript_file.close()
+        await message.channel.send("要約を作成しています。")
+        summary = await asyncio.to_thread(
+            generate_summary,
+            corrected_text[:MAX_TRANSCRIPT_CHARS],
+        )
         await send_chunked(
             message.channel,
             f"**講義要約**\n{summary}",
             reply_message=message,
         )
+        archive_dir = os.path.join(ARCHIVES_DIR, guild_name, channel_name)
+        publish_job(audio_path, txt_path, archive_dir, published)
+    except asyncio.CancelledError:
+        discard_published(published)
+        if archive_dir is not None:
+            prune_empty_dirs(archive_dir)
+        raise
     except Exception as exc:
+        discard_published(published)
+        if archive_dir is not None:
+            prune_empty_dirs(archive_dir)
         print(f"Processing error: {type(exc).__name__}: {exc}")
         try:
             await send_chunked(
@@ -349,12 +468,19 @@ async def on_message(message):
             )
         except discord.DiscordException as send_exc:
             print(f"Failed to send error notice: {type(send_exc).__name__}: {send_exc}")
+    finally:
+        if temp_dir is not None:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 def main():
-    global whisper_model
+    global whisper_model, ALLOWED_USER_IDS
     if not TOKEN:
         raise SystemExit("DISCORD_BOT_TOKEN is not set. Put it in .env and do not commit that file.")
+    try:
+        ALLOWED_USER_IDS = load_allowed_user_ids()
+    except ConfigurationError as exc:
+        raise SystemExit(str(exc)) from exc
     if not ALLOWED_USER_IDS:
         print("Warning: ALLOWED_USER_IDS is empty. Every user is denied.")
     else:
